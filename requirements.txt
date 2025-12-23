@@ -1,0 +1,9 @@
+streamlit
+streamlit-option-menu
+streamlit-webrtc
+sqlalchemy
+pandas
+numpy
+inference-sdk
+pillow
+opencv-python-headless
