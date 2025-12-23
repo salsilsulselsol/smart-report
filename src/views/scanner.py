@@ -91,12 +91,25 @@ def show():
         col_vid, col_instr = st.columns([1.8, 1])
         
         with col_vid:
+            # KONFIGURASI KHUSUS MOBILE
             ctx = webrtc_streamer(
                 key="scanner-live", 
                 video_processor_factory=VideoProcessor,
                 mode=WebRtcMode.SENDRECV,
-                rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-                media_stream_constraints={"video": True, "audio": False},
+                rtc_configuration={
+                    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+                },
+                media_stream_constraints={
+                    "video": {
+                        # Paksa resolusi rendah agar upload cepat (480p)
+                        "width": {"min": 480, "ideal": 640, "max": 640},
+                        "height": {"min": 480, "ideal": 480, "max": 480},
+                        # Pilih kamera belakang (environment)
+                        "facingMode": "environment" 
+                    },
+                    "audio": False
+                },
+                async_processing=True, # Biar tidak memblokir UI utama
             )
 
         with col_instr:
