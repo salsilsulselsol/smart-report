@@ -4,39 +4,47 @@ import utils
 import cv2
 import tempfile
 import time
-import threading
+import os
 from collections import Counter
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
-# --- LOGIKA REAL-TIME (WEBRTC) ---
-class VideoProcessor(VideoTransformerBase):
+# --- CONFIG ---
+RECORD_TIME = 15 # Detik
+
+# --- LOGIKA PEREKAMAN (TANPA AI - SUPAYA LANCAR) ---
+class RecorderProcessor(VideoTransformerBase):
     def __init__(self):
         self.frame_count = 0
-        self.skip_rate = 30
-        self.last_frame = None
-        self.latest_predictions = []
-        self.lock = threading.Lock()
+        self.out = None
+        self.temp_filename = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+        self.is_recording = True
+        self.start_time = time.time()
 
     def transform(self, frame):
+        # Konversi format WebRTC ke OpenCV
         img = frame.to_ndarray(format="bgr24")
-        self.frame_count += 1
         
-        if self.frame_count % self.skip_rate != 0 and self.last_frame is not None:
-            return self.last_frame
+        # Inisialisasi VideoWriter pada frame pertama
+        if self.out is None:
+            h, w = img.shape[:2]
+            # Gunakan 'mp4v' agar kompatibel
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.out = cv2.VideoWriter(self.temp_filename, fourcc, 20.0, (w, h))
+        
+        # Tulis frame ke file (Sangat Cepat, Tidak Lag)
+        if self.is_recording:
+            self.out.write(img)
+            self.frame_count += 1
             
-        h, w = img.shape[:2]
-        new_h = int(h * (640 / w))
-        img_small = cv2.resize(img, (640, new_h))
-        
-        annotated_img, preds = utils.run_ai_workflow(img_small)
-        
-        with self.lock:
-            self.latest_predictions = preds
-            
-        self.last_frame = annotated_img
-        return annotated_img
+        return img # Kembalikan gambar asli agar user melihat dirinya (Mirror)
 
-# --- LOGIKA PERHITUNGAN SKOR ---
+    def stop_recording(self):
+        self.is_recording = False
+        if self.out:
+            self.out.release()
+            self.out = None
+
+# --- LOGIKA SKOR ---
 def calculate_score(unique_counts):
     deduction = 0
     is_critical_failure = False
@@ -64,7 +72,7 @@ def calculate_score(unique_counts):
     
     return final_score, deduction, status
 
-# --- MAIN UI ---
+# --- UI UTAMA ---
 def show():
     db.init_db()
     st.title("📹 AI Facility Audit")
@@ -75,110 +83,157 @@ def show():
         lokasi_ruang = c2.text_input("Ruangan", placeholder="Contoh: S-304")
 
     st.divider()
-    mode = st.radio("Metode Input:", ["Live Camera (15s Audit)", "Upload Video File"], horizontal=True)
+    mode = st.radio("Metode Input:", ["Kamera HP (Rekam -> Proses)", "Upload Video File"], horizontal=True)
 
     # ==========================================
-    # MODE 1: LIVE CAMERA (AUTO SAVE)
+    # MODE 1: REKAM DULU -> BARU PROSES
     # ==========================================
-    if mode == "Live Camera (15s Audit)":
+    if mode == "Kamera HP (Rekam -> Proses)":
         
-        if "scan_active" not in st.session_state: st.session_state.scan_active = False
-        if "scan_finished" not in st.session_state: st.session_state.scan_finished = False
-        if "live_results" not in st.session_state: st.session_state.live_results = Counter()
-        if "start_time" not in st.session_state: st.session_state.start_time = 0
-        if "save_status" not in st.session_state: st.session_state.save_status = None # Untuk pesan sukses
+        # State Management
+        if "phase" not in st.session_state: st.session_state.phase = "IDLE" # IDLE, RECORDING, PROCESSING, DONE
+        if "recorded_file" not in st.session_state: st.session_state.recorded_file = None
+        if "start_rec_time" not in st.session_state: st.session_state.start_rec_time = 0
 
-        col_vid, col_instr = st.columns([1.8, 1])
-        
-        with col_vid:
-            # KONFIGURASI KHUSUS MOBILE
-            ctx = webrtc_streamer(
-                key="scanner-live", 
-                video_processor_factory=VideoProcessor,
-                mode=WebRtcMode.SENDRECV,
-                rtc_configuration={
-                    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-                },
-                media_stream_constraints={
-                    "video": {
-                        # Paksa resolusi rendah agar upload cepat (480p)
-                        "width": {"min": 480, "ideal": 640, "max": 640},
-                        "height": {"min": 480, "ideal": 480, "max": 480},
-                        # Pilih kamera belakang (environment)
-                        "facingMode": "environment" 
-                    },
-                    "audio": False
-                },
-                async_processing=True, # Biar tidak memblokir UI utama
-            )
-
-        with col_instr:
-            st.markdown("##### 📋 Instruksi")
-            st.info("1. Klik **MULAI SCAN**.\n2. Putari objek 360°.\n3. **Otomatis** berhenti & simpan dalam 15 detik.")
+        # 1. FASE IDLE / RECORDING
+        if st.session_state.phase in ["IDLE", "RECORDING"]:
+            col_cam, col_info = st.columns([1.8, 1])
             
-            # Tombol Mulai
-            if not st.session_state.scan_active and not st.session_state.scan_finished:
-                if st.button("▶️ MULAI SCAN (15 Detik)", type="primary", use_container_width=True):
-                    if not lokasi_ruang:
-                        st.error("⚠️ Isi Ruangan dulu!")
+            with col_cam:
+                # WebRTC Streamer
+                ctx = webrtc_streamer(
+                    key="scanner-recorder", 
+                    video_processor_factory=RecorderProcessor,
+                    mode=WebRtcMode.SENDRECV,
+                    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+                    media_stream_constraints={
+                        "video": {
+                            "width": {"ideal": 640}, # Tetap ringan
+                            "height": {"ideal": 480},
+                            "facingMode": "environment"
+                        },
+                        "audio": False
+                    },
+                    async_processing=True
+                )
+
+            with col_info:
+                st.markdown("##### 📸 Instruksi")
+                st.info(f"1. Arahkan kamera.\n2. Klik **MULAI REKAM**.\n3. Tunggu {RECORD_TIME} detik.\n4. AI akan memproses video setelah selesai.")
+                
+                # Logic Tombol Start
+                if st.session_state.phase == "IDLE":
+                    if st.button("🔴 MULAI REKAM", type="primary", width='stretch'):
+                        if not lokasi_ruang:
+                            st.error("Isi Ruangan Dulu!")
+                        else:
+                            st.session_state.phase = "RECORDING"
+                            st.session_state.start_rec_time = time.time()
+                            st.rerun()
+
+                # Logic Timer Saat Recording
+                if st.session_state.phase == "RECORDING":
+                    elapsed = time.time() - st.session_state.start_rec_time
+                    remaining = RECORD_TIME - elapsed
+                    
+                    st.progress(min(elapsed / RECORD_TIME, 1.0), text=f"🎥 Merekam... {int(remaining)}s")
+                    
+                    # Cek Waktu Habis
+                    if elapsed >= RECORD_TIME:
+                        # Ambil file dari processor
+                        if ctx.video_transformer:
+                            ctx.video_transformer.stop_recording()
+                            st.session_state.recorded_file = ctx.video_transformer.temp_filename
+                        
+                        st.session_state.phase = "PROCESSING"
+                        st.rerun()
                     else:
-                        st.session_state.scan_active = True
-                        st.session_state.live_results = Counter()
-                        st.session_state.start_time = time.time()
-                        st.session_state.save_status = None
+                        time.sleep(0.5)
                         st.rerun()
 
-            # Proses Scan Berjalan
-            if st.session_state.scan_active:
-                elapsed = time.time() - st.session_state.start_time
-                remaining = 15 - elapsed
-                
-                prog_val = min(elapsed / 15, 1.0)
-                st.progress(prog_val, text=f"⏳ Menganalisis... {int(remaining)}s")
-                
-                if ctx.video_transformer:
-                    with ctx.video_transformer.lock:
-                        preds = ctx.video_transformer.latest_predictions
-                    if preds:
-                        curr = Counter([p['class'] for p in preds])
-                        for k, v in curr.items():
-                            if v > st.session_state.live_results[k]:
-                                st.session_state.live_results[k] = v
+        # 2. FASE PROCESSING (AI BEKERJA DI SINI)
+        elif st.session_state.phase == "PROCESSING":
+            st.info("⚙️ Video tersimpan! Sekarang sedang memindai kerusakan (AI Processing)...")
+            
+            video_path = st.session_state.recorded_file
+            if not video_path or not os.path.exists(video_path):
+                st.error("Gagal menyimpan video. Coba lagi.")
+                st.session_state.phase = "IDLE"
+                st.stop()
 
-                # JIKA WAKTU HABIS -> AUTO SAVE
-                if elapsed >= 15:
-                    final_res = st.session_state.live_results
-                    score, deduc, stat = calculate_score(final_res)
-                    
-                    # Simpan ke DB Langsung
-                    db.create_laporan(lokasi_gedung, lokasi_ruang, str(dict(final_res)), score, stat, "Auto-Save Live (15s)")
-                    
-                    # Update State
-                    st.session_state.scan_active = False
-                    st.session_state.scan_finished = True
-                    st.session_state.save_status = "Sukses"
-                    st.rerun() # Refresh agar masuk ke blok finish
-                else:
-                    time.sleep(0.5)
-                    st.rerun()
+            # UI Progress
+            c_vid, c_res = st.columns([1.8, 1])
+            with c_vid: stframe = st.empty()
+            with c_res: 
+                prog_bar = st.progress(0)
+                txt_stat = st.empty()
+                live_json = st.empty()
 
-            # Tampilan Setelah Selesai
-            if st.session_state.scan_finished:
-                if st.session_state.save_status == "Sukses":
-                    st.balloons()
-                    st.success(f"✅ Waktu Habis. Data Ruangan {lokasi_ruang} tersimpan otomatis!")
+            # Loop Processing (Sama seperti Upload Video)
+            vf = cv2.VideoCapture(video_path)
+            total_frames = int(vf.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_defects = Counter()
+            curr = 0
+            
+            while vf.isOpened():
+                ret, frame = vf.read()
+                if not ret: break
+                curr += 1
                 
-                res = st.session_state.live_results
-                score, deduc, stat = calculate_score(res)
+                # Update UI
+                if curr % 5 == 0: 
+                    prog_bar.progress(min(curr/total_frames, 1.0))
+                    txt_stat.caption(f"Analyzing Frame: {curr}/{total_frames}")
                 
-                st.metric("Skor Akhir", f"{score}%", f"-{deduc}%", delta_color="inverse")
-                st.metric("Status", stat)
-                st.json(dict(res))
+                # Skip Frame (Biar agak cepat, tapi tetap detil)
+                if curr % 15 != 0: continue 
+
+                # Resize & AI
+                h, w = frame.shape[:2]
+                new_h = int(h * (480 / w))
+                frame_small = cv2.resize(frame, (480, new_h))
                 
-                if st.button("🔄 Scan Objek Lain"):
-                    st.session_state.scan_finished = False
-                    st.session_state.save_status = None
-                    st.rerun()
+                annotated, preds = utils.run_ai_workflow(frame_small)
+                
+                # Aggregasi
+                frame_c = Counter([p['class'] for p in preds])
+                for k, v in frame_c.items():
+                    if v > video_defects[k]: video_defects[k] = v
+                
+                # Tampilkan Bounding Box
+                stframe.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), width='stretch')
+                live_json.json(dict(video_defects))
+
+            vf.release()
+            
+            # Auto Save
+            score, deduc, stat = calculate_score(video_defects)
+            db.create_laporan(lokasi_gedung, lokasi_ruang, str(dict(video_defects)), score, stat, "Live-Rec Audit")
+            
+            # Pindah ke Fase Selesai
+            st.session_state.final_results = video_defects
+            st.session_state.phase = "DONE"
+            st.rerun()
+
+        # 3. FASE DONE (TAMPIL HASIL)
+        elif st.session_state.phase == "DONE":
+            st.balloons()
+            st.success(f"✅ Analisis Selesai! Data Ruangan {lokasi_ruang} tersimpan.")
+            
+            res = st.session_state.final_results
+            score, deduc, stat = calculate_score(res)
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Temuan", sum(res.values()))
+            c2.metric("Skor", f"{score}%", f"-{deduc}%", delta_color="inverse")
+            c3.metric("Status", stat)
+            
+            st.json(dict(res))
+            
+            if st.button("🔄 Audit Ruangan Lain"):
+                st.session_state.phase = "IDLE"
+                st.session_state.recorded_file = None
+                st.rerun()
 
     # ==========================================
     # MODE 2: UPLOAD VIDEO (AUTO SAVE NO LOOP)
@@ -238,7 +293,7 @@ def show():
                     for k, v in frame_c.items():
                         if v > video_defects[k]: video_defects[k] = v
                     
-                    stframe.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
+                    stframe.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), width='stretch')
 
                 vf.release()
                 
